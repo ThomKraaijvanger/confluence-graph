@@ -16,7 +16,7 @@ import type { Page } from "./models.js";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const DEFAULT_PAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../pages");
+const DEFAULT_PAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), "../pages");
 
 function getPagesDir(): string {
   return process.env.PAGES_DIR ?? DEFAULT_PAGES_DIR;

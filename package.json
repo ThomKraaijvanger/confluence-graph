@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "ingest": "tsx src/ingest.ts",
-    "query": "tsx src/query.ts"
+    "query": "tsx src/query.ts",
+    "reset": "tsx src/reset.ts"
   },
   "dependencies": {
     "@mistralai/mistralai": "^2.2.5",
