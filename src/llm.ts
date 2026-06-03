@@ -1,17 +1,24 @@
 /**
  * All LLM interaction lives here.
  *
- * Uses the OpenAI-compatible API so it works with any endpoint:
- * Mistral, Azure OpenAI, a self-hosted model, a company proxy, etc.
- * Configure via LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL in .env.
+ * Uses the Mistral SDK (api.mistral.ai).
+ * Configure via MISTRAL_API_KEY and MISTRAL_MODEL in .env.
  *
  * Two entry points:
  *   analyzePage()   – called during ingest; returns a one-liner + concept tags
  *   runQueryAgent() – agentic loop that traverses the graph to answer questions
+ *
+ * Mistral-specific notes:
+ *   - Tool results use `toolCallId` (not `tool_call_id`)
+ *   - The assistant message must echo back `toolCalls` so Mistral can match IDs
+ *   - `finishReason` / `toolChoice` (camelCase, not snake_case)
  */
 
-import OpenAI from "openai";
-import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions.js";
+import { Mistral } from "@mistralai/mistralai";
+import type {
+  ChatCompletionRequestMessage,
+  ChatCompletionRequestTool,
+} from "@mistralai/mistralai/models/components/index.js";
 import { PageAnalysisSchema, type PageAnalysis } from "./models.js";
 import {
   searchPagesByKeyword,
@@ -24,28 +31,34 @@ import { getPageContent } from "./pages.js";
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
-function getClient(): OpenAI {
-  return new OpenAI({
-    apiKey: process.env.LLM_API_KEY ?? "no-key",
-    baseURL: process.env.LLM_BASE_URL,  // undefined = OpenAI default
-  });
+let client: Mistral | null = null;
+
+function getClient(): Mistral {
+  if (!client) {
+    const apiKey = process.env.MISTRAL_API_KEY;
+    if (!apiKey) throw new Error("MISTRAL_API_KEY not set");
+    client = new Mistral({ apiKey });
+  }
+  return client;
 }
 
-const MODEL = () => process.env.LLM_MODEL ?? "gpt-4o-mini";
+const MODEL = () => process.env.MISTRAL_MODEL ?? "mistral-large-latest";
 
-async function sleep(ms: number) {
+function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 async function chatWithRetry(
-  params: Parameters<OpenAI["chat"]["completions"]["create"]>[0],
+  params: Parameters<InstanceType<typeof Mistral>["chat"]["complete"]>[0],
   maxRetries = 4
-): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+): Promise<Awaited<ReturnType<InstanceType<typeof Mistral>["chat"]["complete"]>>> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await getClient().chat.completions.create(params) as OpenAI.Chat.Completions.ChatCompletion;
+      return await getClient().chat.complete(params);
     } catch (err: unknown) {
-      const is429 = err instanceof OpenAI.APIError && err.status === 429;
+      const is429 =
+        err instanceof Error &&
+        (err.message.includes("429") || err.message.includes("rate_limited"));
       if (is429 && attempt < maxRetries) {
         const wait = 10_000 * (attempt + 1);
         process.stderr.write(`[rate limited, retrying in ${wait / 1000}s]\n`);
@@ -72,7 +85,7 @@ export async function analyzePage(
 
   const response = await chatWithRetry({
     model: MODEL(),
-    response_format: { type: "json_object" },
+    responseFormat: { type: "json_object" },
     messages: [
       {
         role: "system",
@@ -91,14 +104,14 @@ Return ONLY valid JSON. No markdown, no explanation.`,
     ],
   });
 
-  const raw = response.choices[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(raw);
+  const raw = response.choices?.[0]?.message?.content ?? "{}";
+  const parsed = JSON.parse(typeof raw === "string" ? raw : "{}");
   return PageAnalysisSchema.parse(parsed);
 }
 
 // ── Query agent ───────────────────────────────────────────────────────────────
 
-const TOOLS: ChatCompletionTool[] = [
+const TOOLS: ChatCompletionRequestTool[] = [
   {
     type: "function",
     function: {
@@ -179,16 +192,22 @@ const TOOLS: ChatCompletionTool[] = [
   },
 ];
 
-type ToolName = "list_concepts" | "get_concept_neighborhood" | "find_pages_about_concept" | "search_pages" | "get_related_pages" | "get_page_content";
+type ToolName =
+  | "list_concepts"
+  | "get_concept_neighborhood"
+  | "find_pages_about_concept"
+  | "search_pages"
+  | "get_related_pages"
+  | "get_page_content";
 
 async function dispatchTool(name: ToolName, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
-    case "list_concepts":              return listConcepts();
-    case "get_concept_neighborhood":   return getConceptNeighborhood(args["concept"] as string);
-    case "find_pages_about_concept":   return findPagesByConceptName(args["concept"] as string);
-    case "search_pages":               return searchPagesByKeyword(args["keywords"] as string[]);
-    case "get_related_pages":          return getRelatedPages(args["pageId"] as string);
-    case "get_page_content":           return getPageContent(args["pageId"] as string) ?? "Page not found.";
+    case "list_concepts":            return listConcepts();
+    case "get_concept_neighborhood": return getConceptNeighborhood(args["concept"] as string);
+    case "find_pages_about_concept": return findPagesByConceptName(args["concept"] as string);
+    case "search_pages":             return searchPagesByKeyword(args["keywords"] as string[]);
+    case "get_related_pages":        return getRelatedPages(args["pageId"] as string);
+    case "get_page_content":         return getPageContent(args["pageId"] as string) ?? "Page not found.";
   }
 }
 
@@ -196,7 +215,7 @@ export async function runQueryAgent(
   question: string,
   onToolCall?: (name: string, args: unknown) => void
 ): Promise<string> {
-  const messages: ChatCompletionMessageParam[] = [
+  const messages: ChatCompletionRequestMessage[] = [
     {
       role: "system",
       content: `You are a knowledge graph navigator. Use the tools to find relevant pages and answer the user's question.
@@ -210,28 +229,38 @@ Start with list_concepts or search_pages to orient yourself. Synthesise a clear 
       model: MODEL(),
       messages,
       tools: TOOLS,
-      tool_choice: "auto",
+      toolChoice: "auto",
     });
 
-    const choice = response.choices[0];
+    const choice = response.choices?.[0];
     if (!choice) break;
 
     const msg = choice.message;
-    messages.push(msg);
+    if (!msg) break;
+    const content = typeof msg.content === "string" ? msg.content : "";
 
-    if (choice.finish_reason === "stop" || !msg.tool_calls?.length) {
-      return msg.content ?? "(no response)";
+    // Mistral requires the assistant message to include toolCalls so it can
+    // match tool result IDs back to the call that produced them.
+    messages.push({
+      role: "assistant",
+      content,
+      ...(msg.toolCalls?.length ? { toolCalls: msg.toolCalls } : {}),
+    } as ChatCompletionRequestMessage);
+
+    if (choice.finishReason === "stop" || !msg.toolCalls?.length) {
+      return content || "(no response)";
     }
 
-    for (const call of msg.tool_calls) {
-      if (call.type !== "function") continue;
+    for (const call of msg.toolCalls) {
       const name = call.function.name as ToolName;
-      const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+      const rawArgs = call.function.arguments;
+      const args = (typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs) as Record<string, unknown>;
       onToolCall?.(name, args);
       const result = await dispatchTool(name, args);
       messages.push({
         role: "tool",
-        tool_call_id: call.id,
+        toolCallId: call.id,
+        name,
         content: JSON.stringify(result),
       });
     }
