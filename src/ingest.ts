@@ -101,7 +101,7 @@ async function main() {
     const stored = await getPageById(page.id);
     if (stored?.oneLiner) { skipped++; continue; }
 
-    process.stdout.write(chalk.dim(`  ${page.title}... `));
+    console.log(chalk.dim(`  ${page.title}...`));
 
     try {
       const snippet = buildSnippet(page.title, tags, content);
@@ -113,12 +113,20 @@ async function main() {
 
       for (const entity of analysis.entities) {
         if (!entity.name) continue;
-        if (!existingEntities.includes(entity.name)) existingEntities.push(entity.name);
+        // Reuse vs new must be decided BEFORE we add it to existingEntities.
+        const reused = existingEntities.includes(entity.name);
+        if (!reused) existingEntities.push(entity.name);
         await upsertEntity({ name: entity.name, kind: entity.kind, description: entity.description ?? "" });
         await linkPageToEntity(page.id, entity.name, entity.relation);
-      }
 
-      console.log(chalk.green("✓"));
+        // Show the ephemeral layer being built — reused entities are how a new
+        // page wires itself into the existing graph (the demo's "shared waypoints").
+        const tag = reused ? chalk.cyan("↻ reuse") : chalk.green("+ new  ");
+        console.log(
+          `      ${tag} ${chalk.bold(entity.name)} ${chalk.dim(`(${entity.kind})`)} ` +
+          chalk.dim(`—[${entity.relation}]→`)
+        );
+      }
       annotated++;
       if (DELAY_MS > 0) await sleep(DELAY_MS);
     } catch (err) {
