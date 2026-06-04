@@ -6,7 +6,8 @@
  *   derived from wikilinks in the page content.
  *
  * Pass 2 (LLM): for each page not yet annotated, ask the LLM for a one-liner
- *   and 2–5 concept tags, then write Concept nodes and ABOUT edges.
+ *   and 2–6 ephemeral entities (Concept/Person/Technology/Team), then write the
+ *   Entity nodes and typed page→entity edges (USES, OWNED_BY, MENTIONS, …).
  *
  * Flags:
  *   --delay <seconds>   Wait between LLM calls (default: 3). Helps with rate limits.
@@ -16,8 +17,8 @@ import "dotenv/config";
 import chalk from "chalk";
 import {
   setupConstraints, upsertPage, linkPages,
-  upsertConcept, linkPageToConcept,
-  getAllPageIds, getPageById, listConcepts, closeDriver,
+  upsertEntity, linkPageToEntity,
+  getAllPageIds, getPageById, getAllEntityNames, closeDriver,
 } from "./graph.js";
 import { getAllPageFiles, parsePage } from "./pages.js";
 import { analyzePage } from "./llm.js";
@@ -40,9 +41,15 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Demo pages are small (~1–2 KB), so we send the whole body to the annotation
+// pass: people, teams and technologies that make the ephemeral bridges often live
+// further down the page (e.g. a "## Team" section). The cap is a safety net for
+// unexpectedly large pages. For a very large corpus, lower this to control tokens.
+const SNIPPET_CHARS = 4000;
+
 function buildSnippet(title: string, tags: string[], content: string): string {
   const tagLine = tags.length ? `Tags: ${tags.join(", ")}` : "";
-  const body = content.slice(0, 300).replace(/\n+/g, " ").trim();
+  const body = content.slice(0, SNIPPET_CHARS).trim();
   return [title, tagLine, body].filter(Boolean).join("\n");
 }
 
@@ -62,7 +69,8 @@ async function main() {
 
   const wikilinkMap = new Map<string, string[]>();
   for (const file of files) {
-    const { page, wikilinks } = parsePage(file);
+    const { page, wikilinks, content } = parsePage(file);
+    page.content = content;        // store the full body on the node
     wikilinkMap.set(page.id, wikilinks);
     await upsertPage(page);
   }
@@ -80,7 +88,7 @@ async function main() {
 
   // ── Pass 2: LLM annotation layer ─────────────────────────────────────────
 
-  const existingConcepts = (await listConcepts()).map((c) => c.name);
+  const existingEntities = await getAllEntityNames();
   let annotated = 0;
   let skipped = 0;
 
@@ -97,23 +105,24 @@ async function main() {
 
     try {
       const snippet = buildSnippet(page.title, tags, content);
-      const analysis = await analyzePage(page.id, page.title, snippet, existingConcepts);
+      const analysis = await analyzePage(page.id, page.title, snippet, existingEntities);
 
       page.oneLiner = analysis.oneLiner;
+      page.content = content;       // keep the node's textdump in sync
       await upsertPage(page);
 
-      for (const concept of analysis.concepts) {
-        if (!concept.name) continue;
-        if (concept.isNew) existingConcepts.push(concept.name);
-        await upsertConcept({ name: concept.name, description: concept.description ?? "" });
-        await linkPageToConcept(page.id, concept.name);
+      for (const entity of analysis.entities) {
+        if (!entity.name) continue;
+        if (!existingEntities.includes(entity.name)) existingEntities.push(entity.name);
+        await upsertEntity({ name: entity.name, kind: entity.kind, description: entity.description ?? "" });
+        await linkPageToEntity(page.id, entity.name, entity.relation);
       }
 
       console.log(chalk.green("✓"));
       annotated++;
       if (DELAY_MS > 0) await sleep(DELAY_MS);
     } catch (err) {
-      console.log(chalk.red(`✗ ${String(err).split("\n")[0]}`));
+      console.log(chalk.red(`✗ ${String(err).replace(/\s+/g, " ").slice(0, 160)}`));
     }
   }
 

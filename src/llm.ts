@@ -19,15 +19,15 @@ import type {
   ChatCompletionRequestMessage,
   ChatCompletionRequestTool,
 } from "@mistralai/mistralai/models/components/index.js";
-import { PageAnalysisSchema, type PageAnalysis } from "./models.js";
+import { PageAnalysisSchema, ENTITY_KINDS, type PageAnalysis } from "./models.js";
 import {
   searchPagesByKeyword,
-  findPagesByConceptName,
+  findPagesByEntityName,
   getRelatedPages,
-  listConcepts,
-  getConceptNeighborhood,
+  listEntities,
+  getEntityNeighborhood,
+  getPageContent,
 } from "./graph.js";
-import { getPageContent } from "./pages.js";
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ function getClient(): Mistral {
   return client;
 }
 
-const MODEL = () => process.env.MISTRAL_MODEL ?? "mistral-large-latest";
+const MODEL = () => process.env.MISTRAL_MODEL ?? "mistral-medium-latest";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -56,12 +56,16 @@ async function chatWithRetry(
     try {
       return await getClient().chat.complete(params);
     } catch (err: unknown) {
-      const is429 =
-        err instanceof Error &&
-        (err.message.includes("429") || err.message.includes("rate_limited"));
-      if (is429 && attempt < maxRetries) {
+      const m = err instanceof Error ? err.message : String(err);
+      // Retry rate limits and transient server/network errors (the cause of the
+      // occasional dropped page during a batch ingest).
+      const retryable =
+        m.includes("429") || m.includes("rate_limited") ||
+        m.includes("500") || m.includes("502") || m.includes("503") ||
+        m.includes("timeout") || m.includes("ECONN") || m.includes("fetch failed");
+      if (retryable && attempt < maxRetries) {
         const wait = 10_000 * (attempt + 1);
-        process.stderr.write(`[rate limited, retrying in ${wait / 1000}s]\n`);
+        process.stderr.write(`[retrying in ${wait / 1000}s: ${m.split("\n")[0].slice(0, 80)}]\n`);
         await sleep(wait);
       } else {
         throw err;
@@ -77,11 +81,11 @@ export async function analyzePage(
   pageId: string,
   title: string,
   snippet: string,        // title + tags + first ~300 chars — keep it small
-  existingConcepts: string[]
+  existingEntities: string[]
 ): Promise<PageAnalysis> {
-  const conceptHint = existingConcepts.length
-    ? `Reuse these existing concepts where appropriate: ${existingConcepts.slice(0, 60).join(", ")}.`
-    : "No concepts exist yet — create new ones as needed.";
+  const entityHint = existingEntities.length
+    ? `Existing entities in the graph — REUSE these exact names where they apply (do not invent variants): ${existingEntities.slice(0, 80).join(", ")}.`
+    : "No entities exist yet — create new ones as needed.";
 
   const response = await chatWithRetry({
     model: MODEL(),
@@ -92,21 +96,37 @@ export async function analyzePage(
         content: `You are building a semantic knowledge graph over documents.
 For each document, return JSON with:
   - oneLiner: one sentence (max 15 words) describing the page
-  - concepts: 2–5 concept nodes this page belongs to.
-    Each concept: { name (short, Title Case), description (one sentence), isNew (bool) }
+  - entities: 2–6 entities this page references. Each entity:
+      { name, kind, description, relation }
+      • kind: one of ${ENTITY_KINDS.join(", ")}.
+        Concept = a topic/area; Person = a named individual; Technology = a tool,
+        language or system; Team = a named group.
+      • name: canonical and reusable — use a person's real name, the technology's
+        proper name, etc. (Title Case). The SAME entity may be shared by many pages.
+      • description: one sentence.
+      • relation: SHORT_UPPER_SNAKE verb for how THIS page relates to the entity,
+        e.g. USES, OWNED_BY, MAINTAINED_BY, MENTIONS, DEPENDS_ON, ABOUT, RUNS_ON.
 
+Always include every named individual in a leadership, ownership or responsibility
+role (leads, owners, maintainers) as a Person — there may be several on one page.
+Prefer reusing existing entity names so pages that share a person/technology link up.
 Return ONLY valid JSON. No markdown, no explanation.`,
       },
       {
         role: "user",
-        content: `Page: ${pageId}\nTitle: ${title}\n${conceptHint}\n\n${snippet}`,
+        content: `Page: ${pageId}\nTitle: ${title}\n${entityHint}\n\n${snippet}`,
       },
     ],
   });
 
   const raw = response.choices?.[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(typeof raw === "string" ? raw : "{}");
-  return PageAnalysisSchema.parse(parsed);
+  const text = typeof raw === "string" ? raw : "{}";
+  // The model occasionally wraps JSON in prose or a code fence; pull out the object.
+  const jsonText = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1) || "{}";
+  const parsed = PageAnalysisSchema.parse(JSON.parse(jsonText));
+  // Drop entities the model left unnamed.
+  parsed.entities = parsed.entities.filter((e) => e.name.trim());
+  return parsed;
 }
 
 // ── Query agent ───────────────────────────────────────────────────────────────
@@ -115,21 +135,21 @@ const TOOLS: ChatCompletionRequestTool[] = [
   {
     type: "function",
     function: {
-      name: "list_concepts",
-      description: "List all concept nodes with descriptions and page counts. Good first step to orient yourself.",
+      name: "list_entities",
+      description: "List all ephemeral entity nodes (Concept/Person/Technology/Team) with their kind, description and page counts. Good first step to orient yourself.",
       parameters: { type: "object", properties: {} },
     },
   },
   {
     type: "function",
     function: {
-      name: "get_concept_neighborhood",
-      description: "Get a concept's description, its related concepts, and all pages tagged with it.",
+      name: "get_entity_neighborhood",
+      description: "Get an entity's kind and description, the entities it shares pages with, and all pages connected to it. Use this to hop between pages that share a person, technology or team but have no direct link.",
       parameters: {
         type: "object",
-        required: ["concept"],
+        required: ["entity"],
         properties: {
-          concept: { type: "string", description: "Concept name (partial match works)" },
+          entity: { type: "string", description: "Entity name (partial match works)" },
         },
       },
     },
@@ -137,13 +157,13 @@ const TOOLS: ChatCompletionRequestTool[] = [
   {
     type: "function",
     function: {
-      name: "find_pages_about_concept",
-      description: "Find all pages linked to a concept by name.",
+      name: "find_pages_by_entity",
+      description: "Find all pages connected to an entity by name (e.g. all pages that use a technology, or mention a person).",
       parameters: {
         type: "object",
-        required: ["concept"],
+        required: ["entity"],
         properties: {
-          concept: { type: "string" },
+          entity: { type: "string" },
         },
       },
     },
@@ -193,21 +213,21 @@ const TOOLS: ChatCompletionRequestTool[] = [
 ];
 
 type ToolName =
-  | "list_concepts"
-  | "get_concept_neighborhood"
-  | "find_pages_about_concept"
+  | "list_entities"
+  | "get_entity_neighborhood"
+  | "find_pages_by_entity"
   | "search_pages"
   | "get_related_pages"
   | "get_page_content";
 
 async function dispatchTool(name: ToolName, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
-    case "list_concepts":            return listConcepts();
-    case "get_concept_neighborhood": return getConceptNeighborhood(args["concept"] as string);
-    case "find_pages_about_concept": return findPagesByConceptName(args["concept"] as string);
+    case "list_entities":            return listEntities();
+    case "get_entity_neighborhood":  return getEntityNeighborhood(args["entity"] as string);
+    case "find_pages_by_entity":     return findPagesByEntityName(args["entity"] as string);
     case "search_pages":             return searchPagesByKeyword(args["keywords"] as string[]);
     case "get_related_pages":        return getRelatedPages(args["pageId"] as string);
-    case "get_page_content":         return getPageContent(args["pageId"] as string) ?? "Page not found.";
+    case "get_page_content":         return (await getPageContent(args["pageId"] as string)) ?? "Page not found.";
   }
 }
 
@@ -219,7 +239,7 @@ export async function runQueryAgent(
     {
       role: "system",
       content: `You are a knowledge graph navigator. Use the tools to find relevant pages and answer the user's question.
-Start with list_concepts or search_pages to orient yourself. Synthesise a clear answer with page paths as citations.`,
+Start with list_entities or search_pages to orient yourself, then follow entities (people, technologies, teams) to reach pages that have no direct hyperlink between them. Synthesise a clear answer with page paths as citations.`,
     },
     { role: "user", content: question },
   ];

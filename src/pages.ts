@@ -61,13 +61,6 @@ export function getAllPageFiles(): string[] {
   return walkMarkdown(dir).filter((f) => !SKIP_FILENAMES.has(basename(f)));
 }
 
-export function getPageContent(pageId: string): string | null {
-  const match = getAllPageFiles().find((f) => basename(f, extname(f)) === pageId);
-  if (!match) return null;
-  const { content } = matter(readFileSync(match, "utf-8"));
-  return content.trim();
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function extractWikilinks(content: string): string[] {

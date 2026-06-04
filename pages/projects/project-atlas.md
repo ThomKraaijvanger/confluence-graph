@@ -23,7 +23,7 @@ Project Atlas is our internal microservices platform. It provides the foundation
 
 ## Infrastructure
 
-All Atlas services run on [[kubernetes-cluster]] in the `atlas` namespace. Kafka is the backbone for async communication between services — see [[kafka-topics-overview]] for the full topic list.
+All Atlas services run on [[kubernetes-cluster]] in the `atlas` namespace. Kafka is the backbone for async communication between services — see [[kafka-topics-overview]] for the full topic list. Platform infrastructure for Atlas — clusters, namespaces and the Kafka backbone — is owned by our infrastructure lead, **Amir Hassan**.
 
 ## Getting started
 
@@ -33,4 +33,4 @@ New engineers should read [[java-coding-standards]] and [[spring-boot-convention
 
 - Platform lead: Jan de Vries
 - Backend: Priya Sharma, Lucas Müller, Sofia Andersen
-- Infra: Amir Hassan
+- Infrastructure lead: Amir Hassan
