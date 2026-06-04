@@ -8,7 +8,10 @@
     "query": "tsx src/query.ts",
     "reset": "tsx src/reset.ts",
     "demo:reset": "tsx src/reset.ts && tsx src/ingest.ts",
-    "demo:newpage": "PAGES_DIR=incoming tsx src/ingest.ts"
+    "demo:newpage": "PAGES_DIR=incoming tsx src/ingest.ts",
+    "gen:corpus": "tsx src/gen-corpus.ts",
+    "bench:reset": "tsx src/reset.ts && PAGES_DIR=corpus tsx src/ingest.ts",
+    "benchmark": "tsx src/benchmark.ts"
   },
   "dependencies": {
     "@mistralai/mistralai": "^2.2.5",

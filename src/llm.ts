@@ -48,6 +48,22 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ── Token accounting (used by the benchmark) ────────────────────────────────
+export type Usage = { prompt: number; completion: number; total: number };
+
+function readUsage(response: { usage?: Record<string, unknown> }): Usage {
+  const u = response.usage ?? {};
+  const num = (...keys: string[]) => {
+    for (const k of keys) if (typeof u[k] === "number") return u[k] as number;
+    return 0;
+  };
+  return {
+    prompt: num("promptTokens", "prompt_tokens"),
+    completion: num("completionTokens", "completion_tokens"),
+    total: num("totalTokens", "total_tokens"),
+  };
+}
+
 async function chatWithRetry(
   params: Parameters<InstanceType<typeof Mistral>["chat"]["complete"]>[0],
   maxRetries = 4
@@ -233,7 +249,8 @@ async function dispatchTool(name: ToolName, args: Record<string, unknown>): Prom
 
 export async function runQueryAgent(
   question: string,
-  onToolCall?: (name: string, args: unknown) => void
+  onToolCall?: (name: string, args: unknown) => void,
+  onUsage?: (u: Usage) => void
 ): Promise<string> {
   const messages: ChatCompletionRequestMessage[] = [
     {
@@ -251,6 +268,8 @@ Start with list_entities or search_pages to orient yourself, then follow entitie
       tools: TOOLS,
       toolChoice: "auto",
     });
+
+    onUsage?.(readUsage(response));
 
     const choice = response.choices?.[0];
     if (!choice) break;
@@ -287,4 +306,32 @@ Start with list_entities or search_pages to orient yourself, then follow entitie
   }
 
   return "(agent reached iteration limit)";
+}
+
+// ── Naive baseline: stuff the whole corpus into one prompt ──────────────────
+// No graph, no tools — exactly the "read everything every time" approach. Used
+// by the benchmark to contrast against the graph agent on the same model.
+export async function naiveAnswer(
+  question: string,
+  corpusDump: string
+): Promise<{ answer: string; usage: Usage; ms: number }> {
+  const t0 = Date.now();
+  const response = await chatWithRetry({
+    model: MODEL(),
+    messages: [
+      {
+        role: "system",
+        content:
+          "You answer questions about a company wiki. The full set of wiki pages " +
+          "is provided below. Use ONLY that content. When relevant, list every page " +
+          "(by its `path`) that supports your answer.",
+      },
+      { role: "user", content: `${question}\n\n=== WIKI PAGES ===\n${corpusDump}` },
+    ],
+  });
+  const answer = (() => {
+    const c = response.choices?.[0]?.message?.content;
+    return typeof c === "string" ? c : "(no response)";
+  })();
+  return { answer, usage: readUsage(response), ms: Date.now() - t0 };
 }
