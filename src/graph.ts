@@ -20,6 +20,7 @@
 
 import neo4j, { type Driver, type Session } from "neo4j-driver";
 import { ENTITY_KINDS, type Page, type Entity, type EntityKind } from "./models.js";
+import { cleanName, entityKey } from "./normalize.js";
 
 let driver: Driver | null = null;
 
@@ -55,7 +56,8 @@ async function withSession<T>(fn: (s: Session) => Promise<T>): Promise<T> {
 export async function setupConstraints() {
   await withSession(async (s) => {
     await s.run("CREATE CONSTRAINT page_id IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE");
-    await s.run("CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE");
+    // Identity is the canonical key (see normalize.ts), not the display name.
+    await s.run("CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (e:Entity) REQUIRE e.key IS UNIQUE");
   });
 }
 
@@ -137,24 +139,30 @@ function safeRelType(rel: string): string {
 
 export async function upsertEntity(entity: Entity) {
   const kind = safeKind(entity.kind);
+  const name = cleanName(entity.name);
+  const key = entityKey(entity.name);
   await withSession((s) =>
     s.run(
-      // kind is enum-validated above, so the interpolated label is safe.
-      `MERGE (e:Entity {name: $name})
+      // Identity is the canonical key; the display name of the first occurrence
+      // is kept. kind is enum-validated above, so the interpolated label is safe.
+      `MERGE (e:Entity {key: $key})
+       ON CREATE SET e.name = $name
        SET e:${kind}, e.kind = $kind, e.description = $description`,
-      { name: entity.name, kind, description: entity.description }
+      { key, name, kind, description: entity.description }
     )
   );
 }
 
 export async function linkPageToEntity(pageId: string, entityName: string, relation: string) {
   const rel = safeRelType(relation);
+  const key = entityKey(entityName);
   await withSession((s) =>
     s.run(
-      // rel is sanitized to [A-Z0-9_] above, so the interpolated type is safe.
-      `MATCH (p:Page {id: $pageId}), (e:Entity {name: $entityName})
+      // Match the entity by canonical key. rel is sanitized to [A-Z0-9_] above,
+      // so the interpolated type is safe.
+      `MATCH (p:Page {id: $pageId}), (e:Entity {key: $key})
        MERGE (p)-[:${rel}]->(e)`,
-      { pageId, entityName }
+      { pageId, key }
     )
   );
 }

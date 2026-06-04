@@ -22,6 +22,7 @@ import {
 } from "./graph.js";
 import { getAllPageFiles, parsePage } from "./pages.js";
 import { analyzePage } from "./llm.js";
+import { cleanName, entityKey } from "./normalize.js";
 
 const flags = parseFlags(process.argv.slice(2));
 const DELAY_MS = (flags["delay"] ?? 3) * 1000;
@@ -88,7 +89,8 @@ async function main() {
 
   // ── Pass 2: LLM annotation layer ─────────────────────────────────────────
 
-  const existingEntities = await getAllEntityNames();
+  const existingEntities = await getAllEntityNames();      // display names — the LLM reuse hint
+  const seenKeys = new Set(existingEntities.map(entityKey)); // canonical keys — dedup decision
   let annotated = 0;
   let skipped = 0;
 
@@ -112,10 +114,14 @@ async function main() {
       await upsertPage(page);
 
       for (const entity of analysis.entities) {
-        if (!entity.name) continue;
-        // Reuse vs new must be decided BEFORE we add it to existingEntities.
-        const reused = existingEntities.includes(entity.name);
-        if (!reused) existingEntities.push(entity.name);
+        if (!entity.name.trim()) continue;
+        // Reuse vs new is decided by canonical key, BEFORE recording the entity.
+        const key = entityKey(entity.name);
+        const reused = seenKeys.has(key);
+        if (!reused) {
+          seenKeys.add(key);
+          existingEntities.push(cleanName(entity.name));
+        }
         await upsertEntity({ name: entity.name, kind: entity.kind, description: entity.description ?? "" });
         await linkPageToEntity(page.id, entity.name, entity.relation);
 
