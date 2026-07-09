@@ -4,6 +4,8 @@ A Neo4j semantic layer that makes a large document space navigable by a weak LLM
 
 The problem it solves: an LLM cannot reason over hundreds of Confluence pages at once. But it *can* follow a graph. This project builds that graph automatically, then exposes it to the LLM as a set of typed tools so it can traverse the space and answer questions — or find the right pages to read before creating a new one.
 
+New to the codebase? **[WALKTHROUGH.md](WALKTHROUGH.md)** is a guided tour of every file and design decision, structured along the demo beats in [DEMO.md](DEMO.md).
+
 ---
 
 ## How it works
