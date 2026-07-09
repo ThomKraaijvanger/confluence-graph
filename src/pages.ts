@@ -9,6 +9,7 @@
  */
 
 import { readFileSync, readdirSync, statSync } from "fs";
+import { createHash } from "crypto";
 import { join, relative, dirname } from "path";
 import { fileURLToPath } from "url";
 import matter from "gray-matter";
@@ -56,6 +57,12 @@ export function parsePage(absPath: string): ParsedPage {
 
 export function getAllPageFiles(): string[] {
   return walkMarkdown(getPagesDir());
+}
+
+// Fingerprint of a page body, compared against Page.contentHash to decide
+// whether a stored annotation is still current.
+export function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

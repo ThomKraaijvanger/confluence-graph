@@ -15,6 +15,10 @@ export const PageSchema = z.object({
   content: z.string().optional(),
   // Written by the LLM during ingest; used for graph traversal without reading full content
   oneLiner: z.string().optional(),
+  // SHA-256 of the content the annotation was computed from — written together
+  // with oneLiner. A mismatch with the current content marks the page for
+  // re-annotation on the next ingest.
+  contentHash: z.string().optional(),
 });
 export type Page = z.infer<typeof PageSchema>;
 

@@ -133,7 +133,7 @@ This runs in two passes:
 1. **Ground-truth pass** (no LLM): creates all `(:Page)` nodes (storing the page body) and `[:LINKS_TO]` edges. Fast, free.
 2. **Annotation pass** (LLM): for each unannotated page, sends the page to Mistral and gets back a one-liner plus 2–6 entities (`Concept`/`Person`/`Technology`/`Team`), each with a typed relation. Creates `(:Entity)` nodes (merged by name) and the typed `(:Page)->(:Entity)` edges.
 
-The annotation pass is **incremental** — if you stop and restart, already-annotated pages are skipped.
+The annotation pass is **incremental** — pages whose annotation is up to date are skipped. A page whose content changed since its last annotation is re-annotated: its old entity edges are replaced, and entities no page references anymore are swept at the end of the run.
 
 ### Ingest flags
 
@@ -190,9 +190,9 @@ Amir Hassan leads infrastructure across several efforts:
 | `(:Entity)` | LLM-created ephemeral node; carries a second kind-label and lives only in Neo4j |
 | `(:Entity:Concept\|Person\|Technology\|Team)` | The kind-label so the Neo4j Browser colours each type |
 
-**Page properties:** `id`, `title`, `path`, `type`, `tags`, `author`, `created`, `updated`, `content`, `oneLiner`
+**Page properties:** `id`, `title`, `path`, `type`, `tags`, `author`, `created`, `updated`, `content`, `oneLiner`, `contentHash`
 
-**Entity properties:** `name` (unique), `kind`, `description`
+**Entity properties:** `key` (unique, canonical — see `src/normalize.ts`), `name` (display), `kind`, `description`
 
 ### Relationships
 

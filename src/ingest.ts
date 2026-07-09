@@ -3,26 +3,30 @@
  * Ingest pages from PAGES_DIR into the Neo4j graph.
  *
  * Pass 1 (no LLM): build the structural layer — Page nodes and LINKS_TO edges
- *   derived from wikilinks in the page content.
+ *   derived from wikilinks in the page content. Links are re-derived on every
+ *   run, so edits to the source never leave stale edges.
  *
- * Pass 2 (LLM): for each page not yet annotated, ask the LLM for a one-liner
- *   and 2–6 ephemeral entities (Concept/Person/Technology/Team), then write the
- *   Entity nodes and typed page→entity edges (USES, OWNED_BY, MENTIONS, …).
+ * Pass 2 (LLM): for each page whose annotation is missing or stale (content
+ *   changed since it was written — tracked via contentHash), ask the LLM for a
+ *   one-liner and 2–6 ephemeral entities (Concept/Person/Technology/Team), then
+ *   write the Entity nodes and typed page→entity edges (USES, OWNED_BY, …).
+ *   Ingest is incremental: pages with an up-to-date annotation are skipped.
  *
  * Flags:
  *   --delay <seconds>   Wait between LLM calls (default: 3). Helps with rate limits.
- *   --limit <n>         Only annotate the first n unannotated pages (default: all).
+ *   --limit <n>         Only annotate the first n stale pages (default: all).
  */
 import "dotenv/config";
 import chalk from "chalk";
 import {
-  setupConstraints, upsertPage, linkPages,
-  upsertEntity, linkPageToEntity,
+  setupConstraints, upsertPage, linkPages, clearPageLinks,
+  upsertEntity, linkPageToEntity, clearPageEntityEdges, deleteOrphanEntities,
   getAllPageIds, getPageById, getAllEntityNames, closeDriver,
 } from "./graph.js";
-import { getAllPageFiles, parsePage } from "./pages.js";
+import { getAllPageFiles, parsePage, hashContent } from "./pages.js";
 import { analyzePage } from "./llm.js";
 import { cleanName, entityKey } from "./normalize.js";
+import type { Page } from "./models.js";
 
 const flags = parseFlags(process.argv.slice(2));
 const DELAY_MS = (flags["delay"] ?? 3) * 1000;
@@ -54,6 +58,15 @@ function buildSnippet(title: string, tags: string[], content: string): string {
   return [title, tagLine, body].filter(Boolean).join("\n");
 }
 
+// A page that pass 2 must (re-)annotate.
+type StalePage = {
+  page: Page;
+  content: string;
+  tags: string[];
+  hash: string;
+  reannotate: boolean; // had an annotation, but the content changed since
+};
+
 async function main() {
   console.log(chalk.bold("\n── Confluence Graph — Ingest ──\n"));
 
@@ -68,9 +81,24 @@ async function main() {
 
   // ── Pass 1: structural layer ─────────────────────────────────────────────
 
+  const stale: StalePage[] = [];
+  let upToDate = 0;
   const wikilinkMap = new Map<string, string[]>();
+
   for (const file of files) {
-    const { page, wikilinks, content } = parsePage(file);
+    const { page, wikilinks, content, tags } = parsePage(file);
+    const hash = hashContent(content);
+
+    // Decide pass-2 work from the state stored at the last annotation —
+    // read BEFORE the upsert below refreshes the node.
+    const stored = await getPageById(page.id);
+    const hasAnnotation = Boolean(stored?.oneLiner);
+    if (hasAnnotation && stored?.contentHash === hash) {
+      upToDate++;
+    } else if (content) {
+      stale.push({ page, content, tags, hash, reannotate: hasAnnotation });
+    }
+
     page.content = content;        // store the full body on the node
     wikilinkMap.set(page.id, wikilinks);
     await upsertPage(page);
@@ -95,6 +123,7 @@ async function main() {
   };
 
   for (const [id, links] of wikilinkMap) {
+    await clearPageLinks(id);
     for (const target of links) {
       const resolved = resolveTarget(target);
       if (resolved && resolved !== id) await linkPages(id, resolved);
@@ -108,16 +137,9 @@ async function main() {
   const existingEntities = await getAllEntityNames();      // display names — the LLM reuse hint
   const seenKeys = new Set(existingEntities.map(entityKey)); // canonical keys — dedup decision
   let annotated = 0;
-  let skipped = 0;
 
-  for (const file of files) {
+  for (const { page, content, tags, hash, reannotate } of stale) {
     if (annotated >= LIMIT) break;
-
-    const { page, content, tags } = parsePage(file);
-    if (!content) continue;
-
-    const stored = await getPageById(page.id);
-    if (stored?.oneLiner) { skipped++; continue; }
 
     console.log(chalk.dim(`  ${page.title}...`));
 
@@ -125,8 +147,12 @@ async function main() {
       const snippet = buildSnippet(page.title, tags, content);
       const analysis = await analyzePage(page.id, page.title, snippet, existingEntities);
 
+      // Only after a successful analysis: drop edges from the old version of
+      // the content, then record the new annotation as current.
+      if (reannotate) await clearPageEntityEdges(page.id);
+
       page.oneLiner = analysis.oneLiner;
-      page.content = content;       // keep the node's textdump in sync
+      page.contentHash = hash;
       await upsertPage(page);
 
       for (const entity of analysis.entities) {
@@ -156,8 +182,12 @@ async function main() {
     }
   }
 
+  // Re-annotation can leave entities behind that no page references anymore.
+  const orphans = await deleteOrphanEntities();
+  if (orphans) console.log(chalk.dim(`\n  swept ${orphans} orphaned entities`));
+
   const summary = [`${annotated} annotated`];
-  if (skipped) summary.push(`${skipped} already done`);
+  if (upToDate) summary.push(`${upToDate} already up to date`);
   console.log(chalk.bold(`\n── Done: ${summary.join(", ")} ──\n`));
 
   await closeDriver();

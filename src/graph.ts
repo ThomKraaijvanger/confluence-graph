@@ -64,25 +64,37 @@ export async function setupConstraints() {
 // ── Pages ────────────────────────────────────────────────────────────────────
 
 export async function upsertPage(page: Page) {
+  // Only write the fields the caller provided (SET += with a null value would
+  // erase the property) — the structural pass must not wipe what the
+  // annotation pass wrote (oneLiner, contentHash), and vice versa.
+  const props = Object.fromEntries(
+    Object.entries({
+      title: page.title,
+      path: page.path,
+      type: page.type,
+      tags: page.tags,
+      author: page.author,
+      created: page.created,
+      updated: page.updated,
+      content: page.content,
+      oneLiner: page.oneLiner,
+      contentHash: page.contentHash,
+    }).filter(([, v]) => v !== undefined)
+  );
   await withSession((s) =>
     s.run(
       `MERGE (p:Page {id: $id})
        SET p += $props`,
-      {
-        id: page.id,
-        props: {
-          title: page.title,
-          path: page.path,
-          type: page.type,
-          tags: page.tags,
-          author: page.author ?? null,
-          created: page.created ?? null,
-          updated: page.updated ?? null,
-          content: page.content ?? null,
-          oneLiner: page.oneLiner ?? null,
-        },
-      }
+      { id: page.id, props }
     )
+  );
+}
+
+// Drop a page's outgoing LINKS_TO edges so pass 1 can re-derive them — links
+// removed from the source must not linger in the graph.
+export async function clearPageLinks(pageId: string) {
+  await withSession((s) =>
+    s.run(`MATCH (:Page {id: $pageId})-[r:LINKS_TO]->() DELETE r`, { pageId })
   );
 }
 
@@ -165,6 +177,26 @@ export async function linkPageToEntity(pageId: string, entityName: string, relat
       { pageId, key }
     )
   );
+}
+
+// Drop a page's entity edges before re-annotating changed content, so
+// relations extracted from an old version don't linger.
+export async function clearPageEntityEdges(pageId: string) {
+  await withSession((s) =>
+    s.run(`MATCH (:Page {id: $pageId})-[r]->(:Entity) DELETE r`, { pageId })
+  );
+}
+
+// Entities no page points at (left behind by re-annotation) carry no signal.
+export async function deleteOrphanEntities(): Promise<number> {
+  return withSession(async (s) => {
+    const result = await s.run(
+      `MATCH (e:Entity) WHERE NOT (:Page)-->(e)
+       DETACH DELETE e
+       RETURN count(e) AS n`
+    );
+    return (result.records[0].get("n") as { toNumber(): number }).toNumber();
+  });
 }
 
 export async function listEntities(): Promise<Array<{ name: string; kind: string; description: string; pageCount: number }>> {
