@@ -131,7 +131,7 @@ npm run ingest
 This runs in two passes:
 
 1. **Ground-truth pass** (no LLM): creates all `(:Page)` nodes (storing the page body) and `[:LINKS_TO]` edges. Fast, free.
-2. **Annotation pass** (LLM): for each unannotated page, sends the page to Mistral and gets back a one-liner plus 2–6 entities (`Concept`/`Person`/`Technology`/`Team`), each with a typed relation. Creates `(:Entity)` nodes (merged by name) and the typed `(:Page)->(:Entity)` edges.
+2. **Annotation pass** (LLM): for each unannotated page, sends the page to Mistral and gets back a one-liner plus 2–6 entities (`Concept`/`Person`/`Technology`/`Team`), each with a typed relation. Creates `(:Entity)` nodes (merged by a canonical name key) and the typed `(:Page)->(:Entity)` edges. To steer the model toward reusing existing nodes, each call includes a hint listing the entities whose name (or alias) appears in the page plus the most-connected entities — so the hint stays small no matter how large the graph grows.
 
 The annotation pass is **incremental** — pages whose annotation is up to date are skipped. A page whose content changed since its last annotation is re-annotated: its old entity edges are replaced, and entities no page references anymore are swept at the end of the run.
 
@@ -192,7 +192,7 @@ Amir Hassan leads infrastructure across several efforts:
 
 **Page properties:** `id`, `title`, `path`, `type`, `tags`, `author`, `created`, `updated`, `content`, `oneLiner`, `contentHash`
 
-**Entity properties:** `key` (unique, canonical — see `src/normalize.ts`), `name` (display), `kind`, `description`
+**Entity properties:** `key` (unique, canonical — see `src/normalize.ts`), `name` (display), `kind`, `description`, `aliases` (names folded in by `npm run lint`)
 
 ### Relationships
 
@@ -234,12 +234,25 @@ The query agent has six tools:
 
 | Tool | Description |
 |---|---|
-| `list_entities` | List all entity nodes with kind and page counts — good starting point |
+| `list_entities` | List entity nodes with kind and page counts, most-connected first (capped) — good starting point |
 | `get_entity_neighborhood` | An entity's related entities (via shared pages) and all pages connected to it |
 | `find_pages_by_entity` | All pages connected to an entity (partial name match) |
 | `search_pages` | Keyword search on title, tags, and one-liner |
 | `get_related_pages` | Pages reachable from a given page via links **and** shared entities (the ephemeral bridges) |
 | `get_page_content` | Full text of a page, read from the node — used sparingly for detail |
+
+---
+
+## Graph healthcheck (lint)
+
+Deterministic normalization catches `kubernetes` vs `Kubernetes`, but not `K8s` vs `Kubernetes` — that needs meaning. The lint pass audits each entity kind with the LLM and merges true duplicates:
+
+```bash
+npm run lint             # dry run: print proposed merges
+npm run lint -- --apply  # execute them
+```
+
+A merge repoints the duplicate's page edges to the survivor and keeps the duplicate's name as an **alias** on the surviving node. Ingest and entity lookup resolve aliases, so once `K8s` is folded into `Kubernetes`, later pages that say "K8s" link to the `Kubernetes` node instead of re-creating the duplicate. See `NOTES.md` for the design rationale.
 
 ---
 
@@ -254,6 +267,7 @@ src/
 ├── llm.ts         LLM calls — analyzePage() for ingest, runQueryAgent() for queries
 ├── ingest.ts      Entry point: build the graph from PAGES_DIR
 ├── query.ts       Entry point: answer questions via the agent
+├── lint.ts        Entry point: graph healthcheck — merge duplicate entities
 ├── reset.ts       Entry point: wipe the graph
 ├── gen-corpus.ts  Synthetic wiki generator for the scale benchmark
 └── benchmark.ts   Graph agent vs. naive full-context baseline

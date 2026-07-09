@@ -166,8 +166,11 @@ export async function upsertEntity(entity: Entity) {
 }
 
 export async function linkPageToEntity(pageId: string, entityName: string, relation: string) {
+  await linkPageToEntityByKey(pageId, entityKey(entityName), relation);
+}
+
+export async function linkPageToEntityByKey(pageId: string, key: string, relation: string) {
   const rel = safeRelType(relation);
-  const key = entityKey(entityName);
   await withSession((s) =>
     s.run(
       // Match the entity by canonical key. rel is sanitized to [A-Z0-9_] above,
@@ -177,6 +180,43 @@ export async function linkPageToEntity(pageId: string, entityName: string, relat
       { pageId, key }
     )
   );
+}
+
+// Fold `duplicate` into `survivor` (the lint pass's merge operation): repoint
+// the duplicate's page edges keeping their relation types, remember the
+// duplicate's name as an alias — so future ingests and lookups resolve it to
+// the survivor — and delete the node. Returns the number of edges moved.
+export async function mergeEntities(survivorKey: string, duplicateKey: string): Promise<number> {
+  // Edge types are dynamic and Cypher cannot re-create a relationship with a
+  // dynamic type, so read the duplicate's edges and re-link them one by one.
+  const edges = await withSession(async (s) => {
+    const result = await s.run(
+      `MATCH (p:Page)-[r]->(e:Entity {key: $duplicateKey})
+       RETURN p.id AS pageId, type(r) AS rel`,
+      { duplicateKey }
+    );
+    return result.records.map((r) => ({
+      pageId: r.get("pageId") as string,
+      rel: r.get("rel") as string,
+    }));
+  });
+
+  await withSession((s) =>
+    s.run(
+      `MATCH (surv:Entity {key: $survivorKey}), (dup:Entity {key: $duplicateKey})
+       WITH surv, dup, coalesce(surv.aliases, []) + dup.name + coalesce(dup.aliases, []) AS all
+       UNWIND all AS a
+       WITH surv, dup, collect(DISTINCT a) AS aliases
+       SET surv.aliases = [x IN aliases WHERE x <> surv.name]
+       DETACH DELETE dup`,
+      { survivorKey, duplicateKey }
+    )
+  );
+
+  for (const { pageId, rel } of edges) {
+    await linkPageToEntityByKey(pageId, survivorKey, rel);
+  }
+  return edges.length;
 }
 
 // Drop a page's entity edges before re-annotating changed content, so
@@ -199,13 +239,17 @@ export async function deleteOrphanEntities(): Promise<number> {
   });
 }
 
-export async function listEntities(): Promise<Array<{ name: string; kind: string; description: string; pageCount: number }>> {
+// Capped so the agent's opening move stays small on a large graph — the most
+// connected entities carry the most navigation signal.
+export async function listEntities(limit = 50): Promise<Array<{ name: string; kind: string; description: string; pageCount: number }>> {
   return withSession(async (s) => {
     const result = await s.run(
       `MATCH (e:Entity)
        OPTIONAL MATCH (p:Page)-->(e)
        RETURN e.name AS name, e.kind AS kind, e.description AS description, count(p) AS pageCount
-       ORDER BY pageCount DESC`
+       ORDER BY pageCount DESC
+       LIMIT $limit`,
+      { limit: neo4j.int(Math.max(1, Math.floor(limit))) }
     );
     return result.records.map((r) => ({
       name: r.get("name") as string,
@@ -216,12 +260,35 @@ export async function listEntities(): Promise<Array<{ name: string; kind: string
   });
 }
 
-// All distinct entity names currently in the graph — used to nudge the LLM
-// toward reusing existing entities during ingest.
-export async function getAllEntityNames(): Promise<string[]> {
+export type EntityCatalogEntry = {
+  name: string;
+  key: string;
+  kind: string;
+  description: string;
+  aliases: string[];
+  pageCount: number;
+};
+
+// Every entity with its canonical key, aliases and connectivity — the ingest
+// pass matches these against page text to build the reuse hint, and the lint
+// pass audits them for duplicates. Most-connected first.
+export async function getEntityCatalog(): Promise<EntityCatalogEntry[]> {
   return withSession(async (s) => {
-    const result = await s.run("MATCH (e:Entity) RETURN e.name AS name");
-    return result.records.map((r) => r.get("name") as string);
+    const result = await s.run(
+      `MATCH (e:Entity)
+       OPTIONAL MATCH (p:Page)-->(e)
+       RETURN e.name AS name, e.key AS key, e.kind AS kind, e.description AS description,
+              coalesce(e.aliases, []) AS aliases, count(p) AS pageCount
+       ORDER BY pageCount DESC`
+    );
+    return result.records.map((r) => ({
+      name: r.get("name") as string,
+      key: r.get("key") as string,
+      kind: (r.get("kind") as string) ?? "Concept",
+      description: (r.get("description") as string) ?? "",
+      aliases: r.get("aliases") as string[],
+      pageCount: (r.get("pageCount") as { toNumber(): number }).toNumber(),
+    }));
   });
 }
 
@@ -293,8 +360,11 @@ export async function getEntityNeighborhood(entityName: string): Promise<EntityN
   const q = entityKey(entityName);
   return withSession(async (s) => {
     const matches = await s.run(
-      `MATCH (e:Entity) WHERE e.key CONTAINS $q
-       RETURN e.name AS name, e.kind AS kind, e.key AS key
+      `MATCH (e:Entity)
+       WHERE e.key CONTAINS $q
+          OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS $q)
+       RETURN e.name AS name, e.kind AS kind, e.key AS key,
+              coalesce(e.aliases, []) AS aliases
        ORDER BY name LIMIT 25`,
       { q }
     );
@@ -302,11 +372,14 @@ export async function getEntityNeighborhood(entityName: string): Promise<EntityN
       name: r.get("name") as string,
       kind: (r.get("kind") as string) ?? "Concept",
       key: r.get("key") as string,
+      aliases: r.get("aliases") as string[],
     }));
     if (!candidates.length) {
       return { found: false, message: `No entity matches "${entityName}". Try list_entities or search_pages.` };
     }
-    const target = candidates.find((c) => c.key === q) ?? (candidates.length === 1 ? candidates[0] : undefined);
+    const target =
+      candidates.find((c) => c.key === q || c.aliases.some((a) => entityKey(a) === q)) ??
+      (candidates.length === 1 ? candidates[0] : undefined);
     if (!target) {
       return {
         found: false,

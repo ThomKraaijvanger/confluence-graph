@@ -57,3 +57,16 @@ export const PageAnalysisSchema = z.object({
   entities: z.array(AnalyzedEntitySchema).catch([]),
 });
 export type PageAnalysis = z.infer<typeof PageAnalysisSchema>;
+
+// What the LLM returns when the lint pass asks it to audit one entity kind for
+// duplicates: groups of names that denote the same real-world thing. The
+// survivor keeps the node; the duplicates become its aliases.
+const MergeGroupSchema = z.object({
+  survivor: z.string(),
+  duplicates: z.array(z.string()).catch([]),
+  reason: z.string().catch(""),
+});
+export const MergeProposalSchema = z.object({
+  groups: z.array(MergeGroupSchema).catch([]),
+});
+export type MergeGroup = z.infer<typeof MergeGroupSchema>;

@@ -21,7 +21,8 @@ import chalk from "chalk";
 import {
   setupConstraints, upsertPage, linkPages, clearPageLinks,
   upsertEntity, linkPageToEntity, clearPageEntityEdges, deleteOrphanEntities,
-  getAllPageIds, getPageById, getAllEntityNames, closeDriver,
+  getAllPageIds, getPageById, getEntityCatalog, closeDriver,
+  type EntityCatalogEntry,
 } from "./graph.js";
 import { getAllPageFiles, parsePage, hashContent } from "./pages.js";
 import { analyzePage } from "./llm.js";
@@ -66,6 +67,36 @@ type StalePage = {
   hash: string;
   reannotate: boolean; // had an annotation, but the content changed since
 };
+
+// ── Entity reuse hint ────────────────────────────────────────────────────────
+// The LLM can only reuse entities it is shown, but pasting the whole catalog
+// into the prompt stops working past a few dozen entities. Instead we show it
+// the entities whose name (or alias) literally appears in the page — for
+// People/Technologies/Teams a reuse is almost always a literal mention — plus
+// the most-connected entities for concept-level reuse. Deterministic, no extra
+// LLM calls, and the hint stays small however large the graph grows.
+const HINT_MATCHED_MAX = 30;
+const HINT_HUBS = 10;
+
+function mentions(haystack: string, key: string): boolean {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(haystack);
+}
+
+function buildEntityHint(content: string, catalog: EntityCatalogEntry[]): string[] {
+  const haystack = entityKey(content);
+  const matched: string[] = [];
+  for (const e of catalog) {         // catalog is most-connected first
+    if (matched.length >= HINT_MATCHED_MAX) break;
+    const keys = [e.key, ...e.aliases.map(entityKey)];
+    if (keys.some((k) => k && mentions(haystack, k))) matched.push(e.name);
+  }
+  const hubs = catalog
+    .slice(0, HINT_HUBS)
+    .map((e) => e.name)
+    .filter((n) => !matched.includes(n));
+  return [...matched, ...hubs];
+}
 
 async function main() {
   console.log(chalk.bold("\n── Confluence Graph — Ingest ──\n"));
@@ -134,8 +165,15 @@ async function main() {
 
   // ── Pass 2: LLM annotation layer ─────────────────────────────────────────
 
-  const existingEntities = await getAllEntityNames();      // display names — the LLM reuse hint
-  const seenKeys = new Set(existingEntities.map(entityKey)); // canonical keys — dedup decision
+  const catalog = await getEntityCatalog();
+  // Canonical keys AND alias keys resolve to their catalog entry, so an LLM
+  // that says "K8s" links to the existing "Kubernetes" node after a lint merge.
+  const keyIndex = new Map<string, EntityCatalogEntry>();
+  const indexEntry = (e: EntityCatalogEntry) => {
+    keyIndex.set(e.key, e);
+    for (const a of e.aliases) keyIndex.set(entityKey(a), e);
+  };
+  catalog.forEach(indexEntry);
   let annotated = 0;
 
   for (const { page, content, tags, hash, reannotate } of stale) {
@@ -145,7 +183,8 @@ async function main() {
 
     try {
       const snippet = buildSnippet(page.title, tags, content);
-      const analysis = await analyzePage(page.id, page.title, snippet, existingEntities);
+      const hint = buildEntityHint(content, catalog);
+      const analysis = await analyzePage(page.id, page.title, snippet, hint);
 
       // Only after a successful analysis: drop edges from the old version of
       // the content, then record the new annotation as current.
@@ -157,21 +196,28 @@ async function main() {
 
       for (const entity of analysis.entities) {
         if (!entity.name.trim()) continue;
-        // Reuse vs new is decided by canonical key, BEFORE recording the entity.
+        // Reuse vs new is decided by canonical (or alias) key. New entities
+        // join the in-memory catalog so later pages in this run can match them.
         const key = entityKey(entity.name);
-        const reused = seenKeys.has(key);
-        if (!reused) {
-          seenKeys.add(key);
-          existingEntities.push(cleanName(entity.name));
+        let canonical = keyIndex.get(key);
+        const reused = Boolean(canonical);
+        if (!canonical) {
+          canonical = {
+            name: cleanName(entity.name), key, kind: entity.kind,
+            description: entity.description ?? "", aliases: [], pageCount: 0,
+          };
+          catalog.push(canonical);
+          indexEntry(canonical);
+          await upsertEntity({ name: entity.name, kind: entity.kind, description: entity.description ?? "" });
         }
-        await upsertEntity({ name: entity.name, kind: entity.kind, description: entity.description ?? "" });
-        await linkPageToEntity(page.id, entity.name, entity.relation);
+        canonical.pageCount++;
+        await linkPageToEntity(page.id, canonical.name, entity.relation);
 
         // Show the ephemeral layer being built — reused entities are how a new
         // page wires itself into the existing graph (the demo's "shared waypoints").
         const tag = reused ? chalk.cyan("↻ reuse") : chalk.green("+ new  ");
         console.log(
-          `      ${tag} ${chalk.bold(entity.name)} ${chalk.dim(`(${entity.kind})`)} ` +
+          `      ${tag} ${chalk.bold(canonical.name)} ${chalk.dim(`(${canonical.kind})`)} ` +
           chalk.dim(`—[${entity.relation}]→`)
         );
       }

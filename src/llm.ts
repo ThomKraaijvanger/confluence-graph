@@ -19,7 +19,7 @@ import type {
   ChatCompletionRequestMessage,
   ChatCompletionRequestTool,
 } from "@mistralai/mistralai/models/components/index.js";
-import { PageAnalysisSchema, ENTITY_KINDS, type PageAnalysis } from "./models.js";
+import { PageAnalysisSchema, MergeProposalSchema, ENTITY_KINDS, type PageAnalysis, type MergeGroup } from "./models.js";
 import {
   searchPagesByKeyword,
   findPagesByEntityName,
@@ -99,10 +99,10 @@ export async function analyzePage(
   pageId: string,
   title: string,
   snippet: string,        // title + tags + body (capped — see SNIPPET_CHARS in ingest.ts)
-  existingEntities: string[]
+  entityHint: string[]    // curated by the caller: entities mentioned in this page + top hubs (see buildEntityHint in ingest.ts)
 ): Promise<PageAnalysis> {
-  const entityHint = existingEntities.length
-    ? `Existing entities in the graph — REUSE these exact names where they apply (do not invent variants): ${existingEntities.slice(0, 80).join(", ")}.`
+  const hint = entityHint.length
+    ? `Known entities relevant to this page — REUSE these exact names where they apply (do not invent variants): ${entityHint.join(", ")}.`
     : "No entities exist yet — create new ones as needed.";
 
   const response = await chatWithRetry({
@@ -132,7 +132,7 @@ Return ONLY valid JSON. No markdown, no explanation.`,
       },
       {
         role: "user",
-        content: `Page: ${pageId}\nTitle: ${title}\n${entityHint}\n\n${snippet}`,
+        content: `Page: ${pageId}\nTitle: ${title}\n${hint}\n\n${snippet}`,
       },
     ],
   });
@@ -147,6 +147,55 @@ Return ONLY valid JSON. No markdown, no explanation.`,
   return parsed;
 }
 
+// ── Lint: duplicate-entity audit ──────────────────────────────────────────────
+
+// Ask the model which entities of one kind denote the same real-world thing.
+// Deterministic string rules can't see that "K8s" is "Kubernetes" — this can.
+// Called by src/lint.ts, which validates the proposals against the actual
+// catalog before anything is merged.
+export async function proposeEntityMerges(
+  kind: string,
+  entities: Array<{ name: string; description: string; pageCount: number }>
+): Promise<MergeGroup[]> {
+  const listing = entities
+    .map((e) => `- ${e.name} (${e.pageCount} pages): ${e.description || "no description"}`)
+    .join("\n");
+
+  const response = await chatWithRetry({
+    model: MODEL(),
+    responseFormat: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are auditing a knowledge graph for duplicate entities.
+You get every entity of one kind. Group ONLY entities that denote the SAME
+real-world thing: abbreviations (K8s = Kubernetes), spelling or casing variants,
+or unmistakable synonyms.
+
+Do NOT group entities that are merely related or similar — a framework is not
+its plugin (Spring Boot ≠ Spring Cloud Gateway), a team is not its project, and
+two people with similar names are different people unless clearly identical.
+When in doubt, do not merge.
+
+For each group pick the survivor: the canonical, most complete proper name
+(prefer the one with more pages).
+
+Return JSON: {"groups": [{"survivor": name, "duplicates": [names], "reason": one sentence}]}
+Return {"groups": []} if there are no duplicates. JSON only, no explanation.`,
+      },
+      {
+        role: "user",
+        content: `Entity kind: ${kind}\n\n${listing}`,
+      },
+    ],
+  });
+
+  const raw = response.choices?.[0]?.message?.content ?? "{}";
+  const text = typeof raw === "string" ? raw : "{}";
+  const jsonText = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1) || "{}";
+  return MergeProposalSchema.parse(JSON.parse(jsonText)).groups;
+}
+
 // ── Query agent ───────────────────────────────────────────────────────────────
 
 const TOOLS: ChatCompletionRequestTool[] = [
@@ -154,8 +203,13 @@ const TOOLS: ChatCompletionRequestTool[] = [
     type: "function",
     function: {
       name: "list_entities",
-      description: "List all ephemeral entity nodes (Concept/Person/Technology/Team) with their kind, description and page counts. Good first step to orient yourself.",
-      parameters: { type: "object", properties: {} },
+      description: "List entity nodes (Concept/Person/Technology/Team) with their kind, description and page counts, most-connected first (default: top 50). Good first step to orient yourself; use search_pages or get_entity_neighborhood to reach the long tail.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Max entities to return (default 50)" },
+        },
+      },
     },
   },
   {
@@ -240,7 +294,7 @@ type ToolName =
 
 async function dispatchTool(name: ToolName, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
-    case "list_entities":            return listEntities();
+    case "list_entities":            return listEntities(typeof args["limit"] === "number" ? args["limit"] : undefined);
     case "get_entity_neighborhood":  return getEntityNeighborhood(args["entity"] as string);
     case "find_pages_by_entity":     return findPagesByEntityName(args["entity"] as string);
     case "search_pages":             return searchPagesByKeyword(args["keywords"] as string[]);
