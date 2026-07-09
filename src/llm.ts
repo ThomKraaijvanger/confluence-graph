@@ -160,12 +160,12 @@ const TOOLS: ChatCompletionRequestTool[] = [
     type: "function",
     function: {
       name: "get_entity_neighborhood",
-      description: "Get an entity's kind and description, the entities it shares pages with, and all pages connected to it. Use this to hop between pages that share a person, technology or team but have no direct link.",
+      description: "Get an entity's kind and description, the entities it shares pages with, and all pages connected to it. Use this to hop between pages that share a person, technology or team but have no direct link. If the name matches several entities, the result lists candidates — call again with the exact name.",
       parameters: {
         type: "object",
         required: ["entity"],
         properties: {
-          entity: { type: "string", description: "Entity name (partial match works)" },
+          entity: { type: "string", description: "Entity name (exact preferred; a partial match works when unique)" },
         },
       },
     },

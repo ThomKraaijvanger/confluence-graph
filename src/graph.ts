@@ -277,16 +277,46 @@ export async function getRelatedPages(pageId: string): Promise<PageRef[]> {
   });
 }
 
-export async function getEntityNeighborhood(entityName: string): Promise<{
-  entity: { name: string; kind: string; description: string };
-  relatedEntities: string[];
-  pages: PageRef[];
-}> {
+export type EntityNeighborhood =
+  | { found: false; message: string; candidates?: Array<{ name: string; kind: string }> }
+  | {
+      found: true;
+      entity: { name: string; kind: string; description: string };
+      relatedEntities: string[];
+      pages: PageRef[];
+    };
+
+export async function getEntityNeighborhood(entityName: string): Promise<EntityNeighborhood> {
+  // Match on the canonical key: an exact hit wins; a partial hit only counts
+  // when it is unique. Anything else is reported back as candidates instead of
+  // silently picking one ("Java" must never resolve to "JavaScript").
+  const q = entityKey(entityName);
   return withSession(async (s) => {
+    const matches = await s.run(
+      `MATCH (e:Entity) WHERE e.key CONTAINS $q
+       RETURN e.name AS name, e.kind AS kind, e.key AS key
+       ORDER BY name LIMIT 25`,
+      { q }
+    );
+    const candidates = matches.records.map((r) => ({
+      name: r.get("name") as string,
+      kind: (r.get("kind") as string) ?? "Concept",
+      key: r.get("key") as string,
+    }));
+    if (!candidates.length) {
+      return { found: false, message: `No entity matches "${entityName}". Try list_entities or search_pages.` };
+    }
+    const target = candidates.find((c) => c.key === q) ?? (candidates.length === 1 ? candidates[0] : undefined);
+    if (!target) {
+      return {
+        found: false,
+        message: `"${entityName}" is ambiguous — call again with one of the candidate names.`,
+        candidates: candidates.map(({ name, kind }) => ({ name, kind })),
+      };
+    }
+
     const result = await s.run(
-      `MATCH (e:Entity)
-       WHERE toLower(e.name) CONTAINS toLower($entityName)
-       WITH e LIMIT 1
+      `MATCH (e:Entity {key: $key})
        OPTIONAL MATCH (p:Page)-->(e)
        // related entities = those reachable through a shared page
        OPTIONAL MATCH (e)<--(:Page)-->(re:Entity) WHERE re <> e
@@ -296,13 +326,11 @@ export async function getEntityNeighborhood(entityName: string): Promise<{
                 id: p.id, title: p.title, path: p.path,
                 type: p.type, oneLiner: p.oneLiner
               }) AS pages`,
-      { entityName }
+      { key: target.key }
     );
-    if (!result.records.length) {
-      return { entity: { name: entityName, kind: "Concept", description: "" }, relatedEntities: [], pages: [] };
-    }
     const r = result.records[0];
     return {
+      found: true,
       entity: {
         name: r.get("name") as string,
         kind: (r.get("kind") as string) ?? "Concept",
