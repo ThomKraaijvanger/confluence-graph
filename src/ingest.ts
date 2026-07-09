@@ -77,11 +77,27 @@ async function main() {
   }
 
   const allIds = new Set(await getAllPageIds());
-  for (const [slug, links] of wikilinkMap) {
+  // Wikilinks usually carry just a filename ([[project-atlas]]) while page ids
+  // are full PAGES_DIR-relative paths — resolve by unique basename.
+  const byBasename = new Map<string, string[]>();
+  for (const pid of allIds) {
+    const base = pid.split("/").pop()!;
+    byBasename.set(base, [...(byBasename.get(base) ?? []), pid]);
+  }
+  const resolveTarget = (target: string): string | undefined => {
+    if (allIds.has(target)) return target;
+    const candidates = byBasename.get(target) ?? [];
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) {
+      console.log(chalk.yellow(`  ! [[${target}]] is ambiguous (${candidates.join(", ")}) — link skipped`));
+    }
+    return undefined;
+  };
+
+  for (const [id, links] of wikilinkMap) {
     for (const target of links) {
-      if (allIds.has(target) && target !== slug) {
-        await linkPages(slug, target);
-      }
+      const resolved = resolveTarget(target);
+      if (resolved && resolved !== id) await linkPages(id, resolved);
     }
   }
 

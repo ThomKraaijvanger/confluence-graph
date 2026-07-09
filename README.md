@@ -116,7 +116,7 @@ created: 2025-01-15
 Page content here...
 ```
 
-Wikilinks in the content (`[[other-page-slug]]`) are automatically extracted and become `[:LINKS_TO]` edges in the graph.
+Wikilinks in the content (`[[other-page]]`) are automatically extracted and become `[:LINKS_TO]` edges in the graph. A bare filename is resolved against all page basenames; if two pages share a basename the link is skipped with a warning (use the folder-qualified form, e.g. `[[services/auth]]`, to disambiguate).
 
 **For Confluence**: fetch pages via the Confluence REST API and write them as markdown files into `PAGES_DIR`. The ingest step then picks them up. A Confluence → markdown fetcher is a natural next step but is out of scope here.
 
@@ -168,7 +168,7 @@ Query: What is Amir Hassan working on, and what else is he responsible for?
 
   [list_entities] {}
   [get_entity_neighborhood] {"entity":"Amir Hassan"}
-  [get_page_content] {"pageId":"project-hermes"}
+  [get_page_content] {"pageId":"projects/project-hermes"}
 
 Answer:
 
@@ -221,8 +221,8 @@ WITH e, collect(p.title) AS pages
 WHERE size(pages) > 1
 RETURN e.name AS person, pages
 
--- Pages that link to a specific page
-MATCH (p:Page)-[:LINKS_TO]->(target:Page {id: 'project-atlas'})
+-- Pages that link to a specific page (ids are PAGES_DIR-relative paths)
+MATCH (p:Page)-[:LINKS_TO]->(target:Page {id: 'projects/project-atlas'})
 RETURN p.title, p.path
 ```
 

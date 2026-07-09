@@ -2,7 +2,7 @@ import { z } from "zod";
 
 // A Page mirrors one source document — a Confluence page, a markdown file, etc.
 export const PageSchema = z.object({
-  id: z.string(),        // unique slug derived from filename or Confluence page ID
+  id: z.string(),        // unique id: PAGES_DIR-relative path without extension, or Confluence page ID
   title: z.string(),
   path: z.string(),      // source-relative path, used as the "URL" shown to users
   type: z.string(),      // e.g. "article", "summary", "concept" — free-form for flexibility

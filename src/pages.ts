@@ -9,7 +9,7 @@
  */
 
 import { readFileSync, readdirSync, statSync } from "fs";
-import { join, relative, basename, extname, dirname } from "path";
+import { join, relative, dirname } from "path";
 import { fileURLToPath } from "url";
 import matter from "gray-matter";
 import type { Page } from "./models.js";
@@ -22,53 +22,53 @@ function getPagesDir(): string {
   return process.env.PAGES_DIR ?? DEFAULT_PAGES_DIR;
 }
 
-// Files that are structural metadata, not navigable content
-const SKIP_FILENAMES = new Set(["index.md", "log.md", "inbox.md", "reading-list.md", "reading-practice.md"]);
-
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
 export type ParsedPage = {
   page: Page;
   tags: string[];       // convenience alias for page.tags
-  wikilinks: string[];  // slugs of other pages this page links to
+  wikilinks: string[];  // [[...]] targets found in the body, .md stripped
   content: string;      // body text, stripped of frontmatter
 };
 
 export function parsePage(absPath: string): ParsedPage {
   const raw = readFileSync(absPath, "utf-8");
   const { data: fm, content } = matter(raw);
-  const pagesDir = getPagesDir();
-  const relPath = relative(pagesDir, absPath).replace(/\\/g, "/");
-  const slug = basename(absPath, extname(absPath));
+  const relPath = relative(getPagesDir(), absPath).replace(/\\/g, "/");
+  // The id is the PAGES_DIR-relative path without extension, so same-named
+  // files in different folders stay distinct (services/auth vs projects/auth).
+  const id = relPath.replace(/\.md$/, "");
+  const body = content.trim();
 
   const page: Page = {
-    id: slug,
-    title: String(fm["title"] ?? slug),
+    id,
+    title: String(fm["title"] ?? id.split("/").pop()),
     path: relPath,
-    type: deriveType(fm["type"], relPath),
+    type: typeof fm["type"] === "string" && fm["type"] ? fm["type"] : "page",
     tags: Array.isArray(fm["tags"]) ? fm["tags"].map(String) : [],
     author: fm["author"] ? String(fm["author"]) : undefined,
-    created: toDateString(fm["created"] ?? fm["date_ingested"]),
+    created: toDateString(fm["created"]),
     updated: toDateString(fm["updated"]),
-    oneLiner: undefined,
   };
 
-  return { page, tags: page.tags, wikilinks: extractWikilinks(content), content: content.trim() };
+  return { page, tags: page.tags, wikilinks: extractWikilinks(body), content: body };
 }
 
 export function getAllPageFiles(): string[] {
-  const dir = getPagesDir();
-  return walkMarkdown(dir).filter((f) => !SKIP_FILENAMES.has(basename(f)));
+  return walkMarkdown(getPagesDir());
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// [[target]] or [[target|label]]. Any folder prefix in the target is kept so
+// full-path links resolve exactly; bare filenames are resolved against page
+// basenames at ingest time.
 function extractWikilinks(content: string): string[] {
-  const slugs: string[] = [];
+  const targets: string[] = [];
   for (const match of content.matchAll(/\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g)) {
-    slugs.push(basename(match[1].trim(), ".md"));
+    targets.push(match[1].trim().replace(/\.md$/, ""));
   }
-  return [...new Set(slugs)];
+  return [...new Set(targets)];
 }
 
 function walkMarkdown(dir: string, out: string[] = []): string[] {
@@ -84,25 +84,4 @@ function toDateString(value: unknown): string | undefined {
   if (!value) return undefined;
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   return String(value);
-}
-
-// Map directory path prefixes to a human-readable type label.
-// Add entries here as the page structure evolves.
-const PATH_TYPE_MAP: [prefix: string, type: string][] = [
-  ["sources/books", "book"],
-  ["sources/videos", "video"],
-  ["sources/papers", "paper"],
-  ["sources/notes", "note"],
-  ["wiki/summaries", "summary"],
-  ["wiki/concepts", "concept"],
-  ["wiki/entities", "entity"],
-  ["wiki/overviews", "overview"],
-];
-
-function deriveType(fmType: unknown, relPath: string): string {
-  if (typeof fmType === "string" && fmType && fmType !== "source") return fmType;
-  for (const [prefix, type] of PATH_TYPE_MAP) {
-    if (relPath.startsWith(prefix + "/")) return type;
-  }
-  return "page";
 }
