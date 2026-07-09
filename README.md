@@ -247,12 +247,16 @@ The query agent has six tools:
 
 ```
 src/
-├── models.ts    Zod schemas for Page, Entity, PageAnalysis
-├── graph.ts     All Neo4j interaction (CRUD + query tools)
-├── pages.ts     Reads source pages from PAGES_DIR and parses markdown
-├── llm.ts       LLM calls — analyzePage() for ingest, runQueryAgent() for queries
-├── ingest.ts    Entry point: build the graph from PAGES_DIR
-└── query.ts     Entry point: answer questions via the agent
+├── models.ts      Zod schemas for Page, Entity, PageAnalysis
+├── normalize.ts   Deterministic entity-name normalization (canonical key)
+├── graph.ts       All Neo4j interaction (CRUD + query tools)
+├── pages.ts       Reads source pages from PAGES_DIR and parses markdown
+├── llm.ts         LLM calls — analyzePage() for ingest, runQueryAgent() for queries
+├── ingest.ts      Entry point: build the graph from PAGES_DIR
+├── query.ts       Entry point: answer questions via the agent
+├── reset.ts       Entry point: wipe the graph
+├── gen-corpus.ts  Synthetic wiki generator for the scale benchmark
+└── benchmark.ts   Graph agent vs. naive full-context baseline
 ```
 
 ---

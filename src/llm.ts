@@ -74,11 +74,13 @@ async function chatWithRetry(
     } catch (err: unknown) {
       const m = err instanceof Error ? err.message : String(err);
       // Retry rate limits and transient server/network errors (the cause of the
-      // occasional dropped page during a batch ingest).
+      // occasional dropped page during a batch ingest). The SDK's MistralError
+      // carries the HTTP status; network-level failures don't have one.
+      const status = (err as { statusCode?: unknown }).statusCode;
       const retryable =
-        m.includes("429") || m.includes("rate_limited") ||
-        m.includes("500") || m.includes("502") || m.includes("503") ||
-        m.includes("timeout") || m.includes("ECONN") || m.includes("fetch failed");
+        typeof status === "number"
+          ? status === 429 || status >= 500
+          : /timeout|ECONN|fetch failed|socket|network/i.test(m);
       if (retryable && attempt < maxRetries) {
         const wait = 10_000 * (attempt + 1);
         process.stderr.write(`[retrying in ${wait / 1000}s: ${m.split("\n")[0].slice(0, 80)}]\n`);
@@ -96,7 +98,7 @@ async function chatWithRetry(
 export async function analyzePage(
   pageId: string,
   title: string,
-  snippet: string,        // title + tags + first ~300 chars — keep it small
+  snippet: string,        // title + tags + body (capped — see SNIPPET_CHARS in ingest.ts)
   existingEntities: string[]
 ): Promise<PageAnalysis> {
   const entityHint = existingEntities.length
@@ -305,7 +307,21 @@ Start with list_entities or search_pages to orient yourself, then follow entitie
     }
   }
 
-  return "(agent reached iteration limit)";
+  // Tool budget exhausted — force a final synthesis from what was gathered
+  // instead of throwing the collected context away.
+  messages.push({
+    role: "user",
+    content: "Stop searching. Answer the question now, as well as you can, from the information gathered above.",
+  });
+  const final = await chatWithRetry({
+    model: MODEL(),
+    messages,
+    tools: TOOLS,
+    toolChoice: "none",
+  });
+  onUsage?.(readUsage(final));
+  const answer = final.choices?.[0]?.message?.content;
+  return (typeof answer === "string" && answer) || "(no response)";
 }
 
 // ── Naive baseline: stuff the whole corpus into one prompt ──────────────────
