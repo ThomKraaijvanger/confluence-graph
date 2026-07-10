@@ -33,7 +33,7 @@ The graph has two layers:
 
 **Ground-truth layer** — built without LLM involvement, mirrors the source exactly. One `(:Page)` node per document (the full page body is stored on the node); `[:LINKS_TO]` edges from the real hyperlinks/wikilinks in the content.
 
-**Ephemeral layer** — built by the LLM during ingest. The LLM reads each page and extracts 2–6 `(:Entity)` nodes with a *kind* (`Concept`, `Person`, `Technology`, `Team`) and a typed edge describing the relationship (`USES`, `OWNED_BY`, `MENTIONS`, …). Entities live only in Neo4j — they have no counterpart in the source documents. Crucially they are **merged by name**, so a person or technology referenced by several pages becomes one shared node. These shared entities act as navigation waypoints: the query agent can hop *between pages that have no direct hyperlink* by going through the person/technology/team they have in common.
+**Ephemeral layer** — built by the LLM during ingest. The LLM reads each page and extracts 2–6 `(:Entity)` nodes with a *kind* (`Concept`, `Person`, `Technology`, `Team`) and a typed edge describing the relationship (`USES`, `OWNED_BY`, `MENTIONS`, …). Entities live only in Neo4j — they have no counterpart in the source documents. Crucially they are **merged by a canonical name key** (case- and whitespace-insensitive, with aliases folded in by `npm run lint`), so a person or technology referenced by several pages becomes one shared node. These shared entities act as navigation waypoints: the query agent can hop *between pages that have no direct hyperlink* by going through the person/technology/team they have in common.
 
 ---
 
@@ -98,7 +98,7 @@ Edit `.env`:
 | `NEO4J_URI` | Bolt URI (default: `bolt://localhost:7687`) |
 | `NEO4J_USER` | Neo4j username (default: `neo4j`) |
 | `NEO4J_PASSWORD` | Neo4j password — must match `-e NEO4J_AUTH` above |
-| `PAGES_DIR` | Path to the directory containing your source pages |
+| `PAGES_DIR` | Path to the directory containing your source pages (default: `./pages`) |
 
 ### 4. Prepare your source pages
 
@@ -143,7 +143,7 @@ The annotation pass is **incremental** — pages whose annotation is up to date 
 # Custom delay between LLM calls (default: 3 seconds — helps with rate limits)
 npx tsx src/ingest.ts --delay 5
 
-# Annotate only the first N unannotated pages (useful for testing)
+# Annotate only the first N pages needing (re-)annotation (useful for testing)
 npx tsx src/ingest.ts --limit 10
 ```
 
@@ -255,6 +255,20 @@ npm run lint -- --apply  # execute them
 ```
 
 A merge repoints the duplicate's page edges to the survivor and keeps the duplicate's name as an **alias** on the surviving node. Ingest and entity lookup resolve aliases, so once `K8s` is folded into `Kubernetes`, later pages that say "K8s" link to the `Kubernetes` node instead of re-creating the duplicate. See `NOTES.md` for the design rationale.
+
+---
+
+## Benchmark
+
+To show why the graph beats "read everything" on the same model, generate a synthetic wiki at any scale and compare:
+
+```bash
+npm run gen:corpus -- --pages 400   # seeded fake company wiki + ground-truth answers
+npm run bench:reset                  # wipe DB, ingest the corpus (one-time)
+npm run benchmark                    # graph agent vs. full-context baseline
+```
+
+The corpus generator is deterministic, so recall is measured against known ground truth (which pages mention a given person, which services consume Kafka). The headline result: naive token cost grows linearly with corpus size until it exceeds the context window; the graph agent's cost stays roughly constant.
 
 ---
 
